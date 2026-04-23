@@ -1,225 +1,155 @@
 import { Fr } from "@aztec/aztec.js/fields";
-import { AztecAddress } from "@aztec/aztec.js/addresses";
+import { NO_FROM } from "@aztec/aztec.js/account";
 import { createAztecNodeClient } from "@aztec/aztec.js/node";
-import { FeeJuicePaymentMethodWithClaim } from "@aztec/aztec.js/fee";
-import { GasSettings } from "@aztec/stdlib/gas";
+import { SponsoredFeePaymentMethod } from "@aztec/aztec.js/fee/testing";
+import { L1FeeJuicePortalManager } from "@aztec/aztec.js/ethereum";
+import { FeeJuiceContract } from "@aztec/aztec.js/protocol";
+import { getFeeJuiceBalance } from "@aztec/aztec.js/utils";
+import { createLogger } from "@aztec/aztec.js/log";
+import { SponsoredFPCContract } from "@aztec/noir-contracts.js/SponsoredFPC";
+import { getContractInstanceFromInstantiationParams } from "@aztec/stdlib/contract";
 import { EmbeddedWallet } from "@aztec/wallets/embedded";
+import { createExtendedL1Client } from "@aztec/ethereum/client";
+import { createEthereumChain } from "@aztec/ethereum/chain";
 
 const NODE_URL = "https://rpc.testnet.aztec-labs.com";
-const FAUCET_URL = "https://aztec-faucet.nethermind.io/api/drip";
-
-function createGasSettings(node) {
-  const minFees = { feePerDaGas: 0n, feePerL2Gas: 0n };
-  return {
-    get daGas() { return minFees.feePerDaGas; },
-    get l2Gas() { return minFees.feePerL2Gas; },
-    mul(n) {
-      return {
-        feePerDaGas: minFees.feePerDaGas * n,
-        feePerL2Gas: minFees.feePerL2Gas * n
-      };
-    }
-  };
-}
+const L1_RPC_URL = process.env.L1_RPC_URL ?? "https://sepolia.drpc.org";
 
 async function main() {
-  const secretArg = process.argv[2];
-  if (!secretArg) {
-    console.log("Usage: node src/index.js <evm-private-key>");
-    console.log("Example: node src/index.js 0x...");
+  const l2Secret = process.argv[2];
+  const l1PrivateKey = process.env.L1_PRIVATE_KEY;
+
+  if (!l2Secret || !l1PrivateKey) {
+    console.log("Usage: L1_PRIVATE_KEY=<key> node src/index.js <l2-secret>");
+    console.log("");
+    console.log("  <l2-secret>     Any hex string to derive your L2 account (e.g. an Ethereum address)");
+    console.log("  L1_PRIVATE_KEY  32-byte Sepolia private key (0x + 64 hex chars) — needed to mint and bridge fee juice");
+    console.log("  L1_RPC_URL      (optional) Sepolia RPC URL. Default: https://sepolia.drpc.org");
+    console.log("");
+    console.log("Example:");
+    console.log("  L1_PRIVATE_KEY=0xac09...ff80 node src/index.js 0xF4e81041E41EF84cAd81C293F50F5F0e9E3f412E");
     process.exit(1);
   }
 
-  console.log("Creating wallet with prover enabled...");
-  const wallet = await EmbeddedWallet.create(NODE_URL, { 
-    ephemeral: true, 
-    pxeConfig: { proverEnabled: true },
-    databaseOpts: { path: `./db-${Date.now()}` }
-  });
+  const rawKey = l1PrivateKey.replace('0x', '');
+  if (rawKey.length !== 64) {
+    console.error("Error: L1_PRIVATE_KEY must be 32 bytes (0x + 64 hex chars).");
+    console.error(`       Got ${rawKey.length / 2} bytes — did you pass an address instead of a private key?`);
+    process.exit(1);
+  }
 
-  const keyBytes = Buffer.from(secretArg.replace('0x', ''), 'hex');
+  // Derive L2 Schnorr secret by hashing whatever bytes were provided
+  const keyBytes = Buffer.from(l2Secret.replace('0x', ''), 'hex');
   const keyHash = await crypto.subtle.digest('SHA-256', keyBytes);
   const secret = Fr.fromBufferReduce(Buffer.from(keyHash));
 
-  console.log("Creating Schnorr account...");
+  // Connect to L2 and derive L1 chain config from the node
+  console.log("Connecting to L2 node...");
+  const node = createAztecNodeClient(NODE_URL);
+  const { l1ChainId } = await node.getNodeInfo();
+  console.log("L1 chain ID:", l1ChainId);
+
+  const { chainInfo } = createEthereumChain([L1_RPC_URL], l1ChainId);
+  const l1Client = createExtendedL1Client([L1_RPC_URL], l1PrivateKey, chainInfo);
+  console.log("L1 wallet:", l1Client.account.address);
+
+  // Create L2 wallet and Schnorr account
+  console.log("\nCreating L2 wallet...");
+  const wallet = await EmbeddedWallet.create(NODE_URL, {
+    ephemeral: true,
+    pxeConfig: { proverEnabled: true },
+  });
+
   const accountManager = await wallet.createSchnorrAccount(secret, Fr.ZERO);
-  const accountAddr = await accountManager.address;
+  const accountAddr = accountManager.address;
   console.log("Account address:", accountAddr.toString());
 
-  console.log("Checking if already deployed onchain...");
-  const metadata = await wallet.getContractMetadata(accountAddr);
-  const isDeployed = metadata.isContractInitialized;
-  
-  if (isDeployed) {
-    console.log("Account already deployed! Claiming Fee Juice...");
-    await claimFeeJuice(wallet, accountAddr, null);
-    await wallet.stop();
-    return;
-  }
-  
-  console.log("Not deployed, requesting Fee Juice...");
+  // Prepare Sponsored FPC
+  console.log("\nRegistering Sponsored FPC...");
+  const sponsoredFPCInstance = await getContractInstanceFromInstantiationParams(
+    SponsoredFPCContract.artifact,
+    { salt: new Fr(0) }
+  );
+  await wallet.registerContract(sponsoredFPCInstance, SponsoredFPCContract.artifact);
+  console.log("Sponsored FPC at:", sponsoredFPCInstance.address.toString());
+  const sponsoredPaymentMethod = new SponsoredFeePaymentMethod(sponsoredFPCInstance.address);
 
-  let claimData = null;
-  try {
-    const claimResponse = await fetch(
-      FAUCET_URL,
-      { 
-        method: "POST", 
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ address: accountAddr.toString(), asset: "fee-juice" })
-      }
-    );
-    if (claimResponse.ok) {
-      claimData = await claimResponse.json();
-      console.log("Got claim data:", claimData);
+  // Step 1: Deploy account if not already on-chain
+  // node.getContract() is authoritative — an ephemeral PXE starts unsynced
+  console.log("\nChecking deployment status...");
+  const existingInstance = await node.getContract(accountAddr);
+  if (!existingInstance) {
+    console.log("Deploying account with Sponsored FPC...");
+    const deployMethod = await accountManager.getDeployMethod();
+    const deployResult = await deployMethod.send({
+      from: NO_FROM,
+      fee: { paymentMethod: sponsoredPaymentMethod },
+      wait: { returnReceipt: true }
+    });
+    const receipt = deployResult?.receipt ?? deployResult;
+    console.log("  tx:      ", receipt?.txHash?.toString?.() ?? "n/a");
+    console.log("  status:  ", receipt?.status ?? "unknown");
+    console.log("  block:   ", receipt?.blockNumber ?? "n/a");
+    if (receipt?.txHash) {
+      console.log("  explorer:", "https://testnet.aztecscan.xyz/tx-effects/" + receipt.txHash.toString());
     }
-  } catch (e) {
-    console.log("Faucet error:", e.message);
+  } else {
+    console.log("Account already deployed.");
   }
 
-  if (!claimData) {
-    console.log("Failed to get Fee Juice from faucet.");
-    console.log("Please request manually at https://aztec-faucet.nethermind.io");
-    await wallet.stop();
-    process.exit(1);
-  }
+  // Step 2: Mint fee juice on L1 via FeeAssetHandler and bridge it to L2
+  console.log("\nBridging fee juice from L1...");
+  const logger = createLogger("aztec-deploy");
+  const portalManager = await L1FeeJuicePortalManager.new(node, l1Client, logger);
+  const claim = await portalManager.bridgeTokensPublic(accountAddr, undefined, /* mint */ true);
+  console.log("  Amount:  ", (Number(claim.claimAmount) / 1e18).toFixed(6), "FJ");
+  console.log("  Message: ", claim.messageHash);
 
-  console.log("\nWaiting for L1->L2 message (1-2 minutes)...");
-  
-  const node = createAztecNodeClient(NODE_URL);
-  const minFees = await node.getCurrentMinFees();
-  const maxFeesPerGas = minFees.mul(2);
-  const gasSettings = GasSettings.from({
-    gasLimits: { daGas: 1000000n, l2Gas: 1000000n },
-    teardownGasLimits: { daGas: 100000n, l2Gas: 100000n },
-    maxFeesPerGas,
-    maxPriorityFeesPerGas: maxFeesPerGas
-  });
-
-  const c = claimData.claimData;
-  const claim = {
-    claimAmount: BigInt(c.claimAmount),
-    claimSecret: Fr.fromHexString(c.claimSecretHex),
-    messageLeafIndex: BigInt(c.messageLeafIndex)
-  };
-
-  let attempts = 0;
-  const maxAttempts = 60;
-  let ready = false;
-  
-  while (attempts < maxAttempts && !ready) {
+  // Step 3: Wait for the L1->L2 message to be included in L2
+  console.log("\nWaiting for L1->L2 message...");
+  let messageReady = false;
+  for (let i = 0; i < 60 && !messageReady; i++) {
     await new Promise(r => setTimeout(r, 5000));
-    attempts++;
-    
     try {
-      await node.getL1ToL2Message(c.messageHashHex);
-      ready = true;
-      console.log("L1->L2 message ready!");
-    } catch (e) {
-      console.log(`Waiting... (${attempts}/${maxAttempts})`);
+      await node.getL1ToL2Message(claim.messageHash);
+      messageReady = true;
+      console.log("Message included!");
+    } catch {
+      console.log(`  Waiting... (${i + 1}/60)`);
     }
   }
 
-  if (!ready) {
-    console.log("Message not ready. Check L1 tx:", c.l1TxHash);
+  if (!messageReady) {
+    console.log("Message not included after 5 minutes. Try again later.");
     await wallet.stop();
     return;
   }
 
-  console.log("Deploying account + claiming Fee Juice...");
-  const paymentMethod = new FeeJuicePaymentMethodWithClaim(accountAddr, claim);
-  const deployMethod = await accountManager.getDeployMethod();
+  // Step 4: Claim fee juice on L2 — Sponsored FPC pays the transaction fee
+  console.log("\nClaiming fee juice (Sponsored FPC pays the fee)...");
+  const account = await accountManager.getAccount();
+  const feeJuice = FeeJuiceContract.at(account);
 
-  const result = await deployMethod.send({
-    from: AztecAddress.ZERO,
-    fee: { gasSettings, paymentMethod },
-    wait: { returnReceipt: true }
-  });
+  const claimResult = await feeJuice.methods
+    .claim(accountAddr, claim.claimAmount, claim.claimSecret, new Fr(claim.messageLeafIndex))
+    .send({ fee: { paymentMethod: sponsoredPaymentMethod }, wait: { returnReceipt: true } });
 
-  const receipt = result?.receipt ?? result;
-  console.log("\nTransaction:");
-  console.log("  tx:", receipt?.txHash?.toString?.() ?? "n/a");
-  console.log("  status:", receipt?.status ?? "unknown");
-  console.log("  block:", receipt?.blockNumber ?? "n/a");
+  const claimReceipt = claimResult?.receipt ?? claimResult;
+  console.log("  tx:      ", claimReceipt?.txHash?.toString?.() ?? "n/a");
+  console.log("  status:  ", claimReceipt?.status ?? "unknown");
+  console.log("  block:   ", claimReceipt?.blockNumber ?? "n/a");
+  if (claimReceipt?.txHash) {
+    console.log("  explorer:", "https://testnet.aztecscan.xyz/tx-effects/" + claimReceipt.txHash.toString());
+  }
+
+  // Step 5: Print balance
+  console.log("\nFee Juice balance:");
+  const balance = await getFeeJuiceBalance(accountAddr, node);
+  console.log("  ", balance.toString(), "wei");
+  console.log("  ", (Number(balance) / 1e18).toFixed(6), "FJ");
 
   await wallet.stop();
-}
-
-async function claimFeeJuice(wallet, accountAddr, claimData) {
-  if (!claimData) {
-    console.log("No claim data - asking faucet...");
-    try {
-      const res = await fetch(
-        FAUCET_URL,
-        { 
-          method: "POST", 
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ address: accountAddr.toString(), asset: "fee-juice" })
-        }
-      );
-      if (!res.ok) {
-        console.log("Faucet returned:", res.status);
-        return;
-      }
-      claimData = await res.json();
-      console.log("Got claim data:", claimData);
-    } catch (e) {
-      console.log("Faucet error:", e.message);
-      return;
-    }
-  }
-
-  const node = createAztecNodeClient(NODE_URL);
-  const minFees = await node.getCurrentMinFees();
-  const maxFeesPerGas = minFees.mul(2);
-  const gasSettings = GasSettings.from({
-    gasLimits: { daGas: 1000000n, l2Gas: 1000000n },
-    teardownGasLimits: { daGas: 100000n, l2Gas: 100000n },
-    maxFeesPerGas,
-    maxPriorityFeesPerGas: maxFeesPerGas
-  });
-
-  const c = claimData.claimData;
-  const claim = {
-    claimAmount: BigInt(c.claimAmount),
-    claimSecret: Fr.fromHexString(c.claimSecretHex),
-    messageLeafIndex: BigInt(c.messageLeafIndex)
-  };
-
-  console.log("Waiting for L1->L2 message...");
-  let attempts = 0;
-  const maxAttempts = 60;
-  let ready = false;
-  
-  while (attempts < maxAttempts && !ready) {
-    await new Promise(r => setTimeout(r, 5000));
-    attempts++;
-    try {
-      await node.getL1ToL2Message(c.messageHashHex);
-      ready = true;
-    } catch (e) {
-      console.log(`Waiting... (${attempts}/${maxAttempts})`);
-    }
-  }
-
-  if (!ready) {
-    console.log("Message not ready");
-    return;
-  }
-
-  console.log("Claiming Fee Juice...");
-  const paymentMethod = new FeeJuicePaymentMethodWithClaim(accountAddr, claim);
-  
-  const { FeeJuiceContract } = await import("@aztec/aztec.js/protocol");
-  const feeJuice = FeeJuiceContract.at(wallet);
-  
-  const result = await feeJuice.methods
-    .check_balance(0n)
-    .send({ from: accountAddr, fee: { gasSettings, paymentMethod } });
-  
-  const receipt = result?.receipt ?? result;
-  console.log("  tx:", receipt?.txHash?.toString?.() ?? "n/a");
-  console.log("  status:", receipt?.status ?? "unknown");
+  console.log("\nDone!");
 }
 
 main().catch(err => {
